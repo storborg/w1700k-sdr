@@ -33,7 +33,7 @@ DATA_DIR = Path(os.environ.get('XDG_DATA_HOME', '~/.local/share')).expanduser() 
 
 DEFAULTS = {
     # The USB serial adapter on the unit's console header.
-    'uart': '/dev/ttyUSB0',
+    'uart': '/dev/ttyUSB5',
     # The host's address on the link to the unit's management port, and the
     # address the unit uses there (set in RAM only while U-Boot runs).
     'host_ip': '192.168.1.10',

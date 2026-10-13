@@ -36,11 +36,13 @@ class Layout(unittest.TestCase):
         self.assertNotIn('durable', partitions.READ_ONLY['linux'])
 
     def test_ubi_volumes_fit_with_the_bad_block_reserve(self):
-        # 20 per 1024 PEBs of the whole 4096-block chip, plus 4 for UBI itself.
-        self.assertEqual(partitions.UBI_BAD_RESERVE_PEBS, 80)
-        self.assertEqual(partitions.ubi_lebs('system'), 300)
-        self.assertEqual(partitions.DURABLE_LEBS, 172)
-        self.assertEqual(sum(lebs for _, _, lebs in partitions.SYSTEM_VOLUMES), 300)
+        # 20 per 1024 PEBs of the whole chip, plus 4 for UBI itself.
+        reserve, system, durable = {'w25n04kv': (80, 300, 172),
+                                    'w25n04l': (40, 148, 84)}[partitions.PART.name]
+        self.assertEqual(partitions.UBI_BAD_RESERVE_PEBS, reserve)
+        self.assertEqual(partitions.ubi_lebs('system'), system)
+        self.assertEqual(partitions.DURABLE_LEBS, durable)
+        self.assertEqual(sum(lebs for _, _, lebs in partitions.SYSTEM_VOLUMES), system)
         self.assertEqual([name for name, _, _ in partitions.SYSTEM_VOLUMES],
                          ['ubootenv', 'ubootenv2', 'fit', 'rootfs'])
         self.assertGreater(partitions.FIT_VOLUME_BYTES, 12 << 20)
@@ -52,9 +54,35 @@ class Layout(unittest.TestCase):
         end = sum(partitions.GEOMETRY['scratch']) // partitions.BLOCK_BYTES
         self.assertIn(f'#define BMT_WRITE_FIRST {first}u', header)
         self.assertIn(f'#define BMT_WRITE_END {end}u', header)
-        self.assertIn('#define BMT_JOURNAL_BLOCK 3847u', header)
+        # The first reserve block after the BBT of a unit whose top blocks
+        # have no factory-bad block.
+        journal = {'w25n04kv': 3847, 'w25n04l': 1886}[partitions.PART.name]
+        self.assertIn(f'#define BMT_JOURNAL_BLOCK {journal}u', header)
         reserve = partitions.GEOMETRY['reserved-bmt'][0] // partitions.BLOCK_BYTES
         self.assertGreaterEqual(partitions.JOURNAL_PHYSICAL_BLOCK, reserve)
+
+
+class Parts(unittest.TestCase):
+    def test_each_part_has_the_same_byte_layout_and_its_own_geometry(self):
+        sys.path.insert(0, str(ROOT / 'tests'))
+        from test_platform_bmt import partitions_for
+        kv, l = partitions_for('w25n04kv'), partitions_for('w25n04l')
+        self.assertEqual(kv.GEOMETRY, l.GEOMETRY)
+        self.assertEqual((kv.BLOCK_BYTES, kv.PAGE_BYTES, kv.TOTAL_BLOCKS, kv.LEB_BYTES),
+                         (0x20000, 0x800, 4096, 0x1f000))
+        self.assertEqual((l.BLOCK_BYTES, l.PAGE_BYTES, l.TOTAL_BLOCKS, l.LEB_BYTES),
+                         (0x40000, 0x1000, 2048, 0x3e000))
+        self.assertEqual(kv.FIT_VOLUME_BYTES, l.FIT_VOLUME_BYTES)
+        self.assertIn('#define BMT_OOB_FREE 112u', l.policy_header())
+        self.assertIn('#define BMT_TOTAL_BLOCKS 4096u', kv.policy_header())
+        for module in (kv, l):
+            module.check_table()
+
+    def test_an_unknown_part_is_refused(self):
+        sys.path.insert(0, str(ROOT / 'tests'))
+        from test_platform_bmt import partitions_for
+        with self.assertRaises(SystemExit):
+            partitions_for('w25n01gv')
 
 
 class DeviceTrees(unittest.TestCase):

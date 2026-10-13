@@ -28,6 +28,7 @@ def run(settings, serial=None, fit=False, rootfs=False, durable=False, loader=Fa
     wanted += [config.LOADER] if loader else []
     wanted += [config.RECOVERY_FIT] if recovery else []
     config.require_images(*wanted)
+    config.require_part()
     image = None
     if rootfs:
         serial = config.pick_unit(settings.data_dir, serial)

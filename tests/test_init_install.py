@@ -13,6 +13,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'init'), str(Path(__file__).resolve().parent)]
 from initkit import backup, config, install, layout, provision, session, update  # noqa: E402
+import partitions  # noqa: E402
 from initkit.console import StepFailed  # noqa: E402
 from initkit.log import RunLog  # noqa: E402
 import init_fake_unit as fake  # noqa: E402
@@ -36,6 +37,8 @@ class Bench(unittest.TestCase):
                                    ('ROOTFS', 'hsqs', 0x30000), ('DURABLE', 'ubifs', 0x20000)):
             paths[name] = images / name.lower()
             paths[name].write_bytes(fake.fit(marker, size))
+        paths['NAND_PART'] = images / 'nand-part'
+        paths['NAND_PART'].write_text(partitions.PART.name + '\n')
         for patcher in (mock.patch.multiple(config, **paths),
                         mock.patch.object(backup, 'DUMP_BYTES', DUMP_BYTES),
                         mock.patch('builtins.print')):
@@ -158,6 +161,30 @@ class Install(Bench):
         with self.assertRaisesRegex(StepFailed, 'already boots our loader'):
             self.install()
 
+    def test_images_for_another_part_are_refused_before_the_unit_is_touched(self):
+        self.make_unit()
+        other = next(name for name in partitions.PARTS if name != partitions.PART.name)
+        config.NAND_PART.write_text(other + '\n')
+        with self.assertRaisesRegex(SystemExit, f'built for {other}'):
+            self.install()
+        config.NAND_PART.unlink()
+        with self.assertRaisesRegex(SystemExit, 'unrecorded NAND part'):
+            self.install()
+        with self.assertRaisesRegex(SystemExit, 'unrecorded NAND part'):
+            self.flash(fit=True)
+        self.assertFalse(self.unit.log)
+        self.assertEqual(self.install(backup_only=True), 0)
+
+    def test_a_unit_of_another_part_is_backed_up_but_not_written(self):
+        other = next(part for part in partitions.PARTS.values() if part != partitions.PART)
+        self.make_unit()
+        self.unit.page_bytes, self.unit.oob_bytes = other.page, other.oob
+        with self.assertRaisesRegex(StepFailed, f'W1700K_NAND={other.name}'):
+            self.install()
+        self.assertTrue(any(line.startswith('tftpput') for line in self.commands()))
+        self.assertFalse(any(line.startswith(('flash ', 'saveenv', 'mtd erase', 'ubi '))
+                             for line in self.commands()))
+
 
 class Flash(Bench):
     def test_a_system_update_from_linux(self):
@@ -224,9 +251,11 @@ class Layout(unittest.TestCase):
         self.assertEqual(again[-1], 'saveenv')
 
     def test_volumes_are_created_in_id_order(self):
+        # 128 or 64 LEBs of FIT (15.5 MiB either way); the root takes the rest.
+        rootfs = {'w25n04kv': 170 * 0x1f000, 'w25n04l': 82 * 0x3e000}[partitions.PART.name]
         self.assertEqual(layout.create_system_volumes(), [
             'ubi create ubootenv 0x4000 d 0', 'ubi create ubootenv2 0x4000 d 1',
-            f'ubi create fit {128 * 0x1f000:#x} s 2', f'ubi create rootfs {170 * 0x1f000:#x} s 3'])
+            'ubi create fit 0xf80000 s 2', f'ubi create rootfs {rootfs:#x} s 3'])
 
     def test_erase_steps_cover_the_partition_exactly(self):
         steps = layout.erase('system')
@@ -274,12 +303,17 @@ class Parsing(unittest.TestCase):
             self.assertFalse(any(line.startswith('md.b') for _, line in unit.log))
 
     def test_a_chip_of_another_geometry_is_not_written(self):
+        other = next(part for part in partitions.PARTS.values() if part != partitions.PART)
         with tempfile.TemporaryDirectory() as served:
             unit = fake.FakeUnit(served)
             unit.state = 'dumper'
             backup.check_platform_part(unit)
-            unit.page_bytes, unit.oob_bytes = 0x1000, 256
-            with self.assertRaisesRegex(StepFailed, 'nothing was written'):
+            unit.page_bytes, unit.oob_bytes = other.page, other.oob
+            with self.assertRaisesRegex(StepFailed, f'W1700K_NAND={other.name}.*'
+                                        'nothing was written'):
+                backup.check_platform_part(unit)
+            unit.page_bytes, unit.oob_bytes = 0x200, 16
+            with self.assertRaisesRegex(StepFailed, r'\(\d+ and \d+\)\. The backup'):
                 backup.check_platform_part(unit)
 
     def test_a_writable_chip_is_refused(self):

@@ -15,7 +15,7 @@ static void ubi_consumers(void)
  ubi.ro_mode=0;ubi.beb_rsvd_pebs=0;
  assert(actual_bad_peb_tail(&ubi,0)==-EOPNOTSUPP && ubi.ro_mode && ubi.avail_pebs==10);
  base(0);ubi.ro_mode=0;fail_original=fail_metadata=1;
- assert(ubi_io_write(&ubi,data,0,0,PS)==-EIO && last_written==1024);
+ assert(ubi_io_write(&ubi,data,0,0,PS)==-EIO && last_written==PS/2);
  unsigned before=mutations;erase_calls=0;
  assert(do_sync_erase(&ubi,0)==-EIO && erase_calls==UBI_IO_RETRIES+1);
  assert(mutations==before && actual_bad_peb_tail(&ubi,0)==-EIO && ubi.ro_mode);

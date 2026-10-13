@@ -6,9 +6,12 @@ Two stages, in the vendor's order:
     logical --[BBT shift]--> physical --[BMT substitution]--> final
 
 The BBT lists factory-bad physical blocks below the reserve pool; logical blocks
-skip them. The BMT maps worn blocks into the reserve pool. The pool is the last
-250 blocks of a 4096-block part (the vendor clamps it to the table capacity), and
-the BMT checksum covers the whole 250-entry area.
+skip them. The BMT maps worn blocks into the reserve pool. Stock measures the
+pool at boot: counting down from the last block, it stops when total*8/100
+blocks without a factory-bad marker have been seen. It fails above total/8 and
+is clamped to the 250-entry table capacity, so a 4096-block part always has 250
+and a 2048-block part 163 or more. The BMT checksum covers one entry per pool
+block.
 
 The fixture builders make synthetic tables only; they are not vendor data.
 """
@@ -47,9 +50,25 @@ def clamped_pool(total_blocks=TOTAL_BLOCKS):
     return MAX_ENTRIES if pool_floor(total_blocks) > MAX_ENTRIES else None
 
 
-def system_blocks_for(total_blocks=TOTAL_BLOCKS):
-    pool = clamped_pool(total_blocks)
+def system_blocks_for(total_blocks=TOTAL_BLOCKS, pool_blocks=None):
+    pool = clamped_pool(total_blocks) if pool_blocks is None else pool_blocks
     return None if pool is None else total_blocks - pool
+
+
+def pool_scan(total_blocks, factory_bad):
+    """Stock's measured pool, or None where its BMT init fails.
+
+    `factory_bad` is the set of blocks whose first-page OOB byte 0 is not 0xff.
+    Block 0 is never examined.
+    """
+    target = pool_floor(total_blocks)
+    good_seen = [block for block in range(total_blocks - 1, 0, -1)
+                 if block not in factory_bad][:target]
+    pool = total_blocks - good_seen[-1] if target and len(good_seen) == target \
+        else total_blocks
+    if pool > pool_ceiling(total_blocks):
+        return None
+    return min(pool, MAX_ENTRIES)
 
 
 def bbt_checksum(blob):
@@ -74,7 +93,7 @@ def parse_bbt(blob):
 def parse_bmt(blob, pool_blocks=MAX_ENTRIES):
     _require(len(blob) >= BMT_BYTES and blob[:3] == BMT_MAGIC, 'not a BMT')
     version, _unused, size, stored = struct.unpack_from('<BBBB', blob, 3)
-    _require(version and size <= MAX_ENTRIES, 'BMT header is invalid')
+    _require(version and size <= pool_blocks, 'BMT header is invalid')
     _require(stored == bmt_checksum(blob, pool_blocks), 'BMT checksum mismatch')
     return {'size': size,
             'entries': [dict(zip(('from', 'to'), struct.unpack_from(
@@ -126,13 +145,20 @@ def bbt(entries, version=1, size=None, checksum=None):
     return bytes(table)
 
 
-def bmt(pairs, pool_blocks=MAX_ENTRIES, version=1, size=None, checksum=None):
+def bmt(pairs, pool_blocks=MAX_ENTRIES, version=1, size=None, checksum=None,
+        vendor=False):
+    """A BMT; `vendor` lays it out as stock writes one: 0xff header padding,
+    one zeroed entry per pool block and 0xff beyond."""
     table = bytearray([FILL]) * BMT_BYTES
     table[0:3] = BMT_MAGIC
     table[3] = version
     table[5] = len(pairs) if size is None else size
     table[6] = 0
-    table[7:BMT_HEADER] = bytes(BMT_HEADER - 7)
+    if vendor:
+        table[BMT_HEADER:BMT_HEADER + BMT_STRIDE * pool_blocks] = \
+            bytes(BMT_STRIDE * pool_blocks)
+    else:
+        table[7:BMT_HEADER] = bytes(BMT_HEADER - 7)
     for index, (source, target) in enumerate(pairs):
         struct.pack_into('<HH', table, BMT_HEADER + BMT_STRIDE * index, source, target)
     table[6] = bmt_checksum(table, pool_blocks) if checksum is None else checksum

@@ -5,7 +5,7 @@
 #include "airoha_bmt_write.h"
 
 #define AIROHA_IMAGE_STRIDE (AIROHA_WRITE_PAGE + AIROHA_WRITE_OOB)
-#define AIROHA_IMAGE_BYTES (64u * AIROHA_IMAGE_STRIDE)
+#define AIROHA_IMAGE_BYTES (AIROHA_WRITE_PAGES * AIROHA_IMAGE_STRIDE)
 #define AIROHA_TRANSACTION_WORK_BYTES (2u * AIROHA_IMAGE_BYTES)
 
 enum airoha_pool_role {
@@ -56,7 +56,7 @@ struct airoha_bmt_transaction {
 	struct airoha_bmt_data_io io;
 	struct airoha_bmt_flash publisher;
 	airoha_u32 first, end, bbt_block, bmt_block, journal_block, cursor;
-	airoha_u8 pool[250];
+	airoha_u8 pool[AIROHA_BMT_MAX_ENTRIES];	/* roles from system_blocks up */
 	airoha_u8 *image, *verify;
 	airoha_u8 expected[AIROHA_WRITE_PAGE], actual[AIROHA_WRITE_PAGE];
 	int ready, busy, failed, has_pending;

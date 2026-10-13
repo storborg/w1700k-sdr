@@ -2,8 +2,8 @@ SPDX-License-Identifier: GPL-2.0+
 Subject: [PATCH] mtd: spinand: winbond: add the W25N04L (ID 0xef 0x8b 0x23)
 
 Some W1700K units carry this part instead of the W25N04KV; without an
-entry the chip does not probe ("unknown raw ID ef 8b 23 00") and the dumper
-has nothing to read. Its geometry is inferred, not taken from a datasheet:
+entry the chip does not probe ("unknown raw ID ef 8b 23 00") and neither
+the dumper nor the loader has anything to read. Its geometry is inferred, not taken from a datasheet:
 the stock loader reports 512 MiB and a 163-block BMT pool, which its pool
 sizing gives only for 2048 blocks, so 256 KiB blocks of 64 4 KiB pages with
 256 bytes of OOB. The raw whole-chip image is the same size as the

@@ -14,6 +14,8 @@ host and drive them:
   to have prepared them).
 """
 import ctypes
+import importlib.util
+import os
 from pathlib import Path
 import resource
 import shutil
@@ -34,6 +36,42 @@ CC = shutil.which('cc') or shutil.which('gcc')
 TOTAL = model.TOTAL_BLOCKS
 SYSTEM = model.system_blocks_for(TOTAL)
 POOL = model.clamped_pool(TOTAL)
+FACTORY_BAD = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+# The vendor tables of a W25N04L unit (2048 blocks), as read from its NAND: six
+# factory-bad blocks, an empty BMT, and the 163-block pool stock reported.
+UNIT_BBT = (b'RAWB' + bytes.fromhex('1c030000') + bytes([1, 6, 255, 255]) +
+            bytes.fromhex('0004330466049904cc04ff04') + bytes(488))
+UNIT_BMT = (b'BMT' + bytes([1, 255, 0, 1]) + b'\xff' * 13 + bytes(4 * 163) +
+            b'\xff' * (4 * 87))
+UNIT_FACTORY = [1024, 1075, 1126, 1177, 1228, 1279]
+
+
+def partitions_for(part):
+    """platform/partitions.py as evaluated for one NAND part."""
+    spec = importlib.util.spec_from_file_location(f'partitions_{part}',
+                                                  ROOT / 'platform/partitions.py')
+    module = importlib.util.module_from_spec(spec)
+    saved = os.environ.get('W1700K_NAND')
+    os.environ['W1700K_NAND'] = part
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if saved is None:
+            del os.environ['W1700K_NAND']
+        else:
+            os.environ['W1700K_NAND'] = saved
+    return module
+
+
+def policy_headers(directory):
+    """One include directory per part, holding that part's airoha_bmt_policy.h."""
+    out = {}
+    for part in partitions.PARTS:
+        include = Path(directory) / part
+        include.mkdir()
+        (include / 'airoha_bmt_policy.h').write_text(partitions_for(part).policy_header())
+        out[part] = include
+    return out
 # Factory bad blocks straddling the ownership boundaries, and two worn blocks
 # substituted into the reserve pool.
 FACTORY = [5, 11, 20, 40, 100]
@@ -78,7 +116,10 @@ class Translation(unittest.TestCase):
                      'airoha_bmt_clamped_pool'):
             getattr(lib, name).restype = ctypes.c_uint32
             getattr(lib, name).argtypes = [ctypes.c_uint32]
-        lib.airoha_bmt_set_geometry.argtypes = [ctypes.POINTER(Table), ctypes.c_uint32]
+        lib.airoha_bmt_set_geometry.argtypes = [ctypes.POINTER(Table), ctypes.c_uint32,
+                                                ctypes.c_uint32]
+        lib.airoha_bmt_pool_scan.argtypes = [ctypes.c_uint32, FACTORY_BAD, ctypes.c_void_p,
+                                             ctypes.POINTER(ctypes.c_uint32)]
         for name in ('airoha_bmt_parse_bbt', 'airoha_bmt_parse_bmt'):
             getattr(lib, name).argtypes = [ctypes.POINTER(Table), ctypes.c_char_p,
                                            ctypes.c_uint32]
@@ -95,13 +136,24 @@ class Translation(unittest.TestCase):
         table = Table()
         bbt = model.bbt(FACTORY) if bbt is None else bbt
         bmt = model.bmt(REMAP) if bmt is None else bmt
-        self.assertEqual(self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL), 0)
+        self.assertEqual(self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL, POOL), 0)
         self.assertEqual(self.lib.airoha_bmt_parse_bbt(ctypes.byref(table), bbt, len(bbt)), 0)
         self.assertEqual(self.lib.airoha_bmt_parse_bmt(ctypes.byref(table), bmt, len(bmt)), 0)
         return table
 
     def test_struct_layout_matches_the_c_definition(self):
         self.assertEqual(self.lib.airoha_bmt_sizeof(), ctypes.sizeof(Table))
+
+    def scan(self, total, bad, error_at=None):
+        reads = []
+
+        def factory_bad(_, block):
+            reads.append(block)
+            return -5 if block == error_at else int(block in bad)
+        pool = ctypes.c_uint32(0)
+        status = self.lib.airoha_bmt_pool_scan(total, FACTORY_BAD(factory_bad), None,
+                                               ctypes.byref(pool))
+        return status, pool.value, reads
 
     def test_pool_is_clamped_to_the_table_capacity(self):
         self.assertEqual(self.lib.airoha_bmt_pool_floor(TOTAL), TOTAL * 8 // 100)
@@ -110,9 +162,72 @@ class Translation(unittest.TestCase):
         small = TOTAL // 2
         self.assertIsNone(model.clamped_pool(small))
         self.assertEqual(self.lib.airoha_bmt_clamped_pool(small), 0)
+
+    def test_the_pool_is_measured_as_stock_measures_it(self):
+        top = {2048: 2048 - 163, 4096: 4096 - 327}
+        for total in (2048, 4096):
+            cases = [set(), {total - 1}, {top[total]}, {top[total] - 1},
+                     set(range(total - 30, total)), set(range(top[total] - 80, total, 3)),
+                     {5, 11, 1024}, set(range(1, total))]
+            for bad in cases:
+                with self.subTest(total=total, bad=len(bad)):
+                    status, pool, reads = self.scan(total, bad)
+                    expected = model.pool_scan(total, bad)
+                    if expected is None:
+                        self.assertEqual(status, ERRORS['UNPINNABLE'])
+                        continue
+                    self.assertEqual((status, pool), (0, expected))
+                    # Only the span stock reads; block 0 never.
+                    self.assertEqual(reads[0], total - 1)
+                    self.assertNotIn(0, reads)
+        # On the smaller part a factory-bad block in the span grows the pool,
+        # which moves the reserve; on the larger the clamp absorbs it.
+        self.assertEqual(self.scan(2048, set())[1], 163)
+        self.assertEqual(self.scan(2048, {2047, 1900})[1], 165)
+        self.assertEqual(self.scan(4096, {4095, 3900})[1], 250)
+        status, _, reads = self.scan(2048, set(), error_at=2000)
+        self.assertEqual(status, -5)
+        self.assertEqual(reads[-1], 2000)
+
+    def test_only_a_pool_stock_can_measure_is_accepted(self):
         table = Table()
-        self.assertEqual(self.lib.airoha_bmt_set_geometry(ctypes.byref(table), small),
-                         ERRORS['UNPINNABLE'])
+        for total, pool, status in [(4096, 250, 0), (4096, 249, 'UNPINNABLE'),
+                                    (4096, 251, 'UNPINNABLE'), (2048, 163, 0),
+                                    (2048, 250, 0), (2048, 162, 'UNPINNABLE'),
+                                    (2048, 251, 'UNPINNABLE'), (1024, 129, 'UNPINNABLE'), (1024, 128, 0),
+                                    (1024, 81, 0), (0x10000, 250, 'RANGE')]:
+            with self.subTest(total=total, pool=pool):
+                self.assertEqual(self.lib.airoha_bmt_set_geometry(ctypes.byref(table),
+                                                                  total, pool),
+                                 ERRORS.get(status, 0))
+                if not status:
+                    self.assertEqual(table.system_blocks, total - pool)
+
+    def test_a_w25n04l_units_tables_validate_at_its_measured_pool(self):
+        table = Table()
+        status, pool, _ = self.scan(2048, set(UNIT_FACTORY))
+        self.assertEqual((status, pool), (0, 163))
+        self.assertEqual(self.lib.airoha_bmt_set_geometry(ctypes.byref(table), 2048, pool), 0)
+        self.assertEqual(table.system_blocks, 1885)
+        self.assertEqual(self.lib.airoha_bmt_parse_bbt(ctypes.byref(table), UNIT_BBT,
+                                                       len(UNIT_BBT)), 0)
+        self.assertEqual(self.lib.airoha_bmt_parse_bmt(ctypes.byref(table), UNIT_BMT,
+                                                       len(UNIT_BMT)), 0)
+        self.assertEqual(list(table.bbt_entries[:table.bbt_size]), UNIT_FACTORY)
+        self.assertEqual(self.lib.airoha_bmt_usable_blocks(ctypes.byref(table)), 1879)
+        self.assertEqual(self.lib.airoha_bmt_translate(ctypes.byref(table), 1023), 1023)
+        self.assertEqual(self.lib.airoha_bmt_translate(ctypes.byref(table), 1024), 1025)
+        self.assertEqual(self.lib.airoha_bmt_translate(ctypes.byref(table), 1878), 1884)
+        bbt = model.parse_bbt(UNIT_BBT)
+        self.assertEqual(model.parse_bmt(UNIT_BMT, 163)['size'], 0)
+        for logical in range(0, 1879, 7):
+            self.assertEqual(self.lib.airoha_bmt_translate(ctypes.byref(table), logical),
+                             model.translate(logical, bbt, {'entries': []}, 1885))
+        # The vendor's checksum covers exactly 163 entries: no other pool parses it.
+        for other in (164, 170, 250):
+            self.lib.airoha_bmt_set_geometry(ctypes.byref(table), 2048, other)
+            self.assertEqual(self.lib.airoha_bmt_parse_bmt(ctypes.byref(table), UNIT_BMT,
+                                                           len(UNIT_BMT)), ERRORS['CHECKSUM'])
 
     def test_every_block_translates_like_the_model(self):
         table = self.loaded()
@@ -149,7 +264,7 @@ class Translation(unittest.TestCase):
 
     def test_invalid_tables_are_refused_never_repaired(self):
         table = Table()
-        self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL)
+        self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL, POOL)
         broken = bytearray(model.bmt(REMAP))
         broken[model.BMT_HEADER + 4 * (POOL - 1)] ^= 1
         cases = {
@@ -173,7 +288,7 @@ class Translation(unittest.TestCase):
 
     def test_a_descending_bbt_refuses_translation(self):
         table = Table()
-        self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL)
+        self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL, POOL)
         descending = model.bbt(list(reversed(FACTORY)))
         self.lib.airoha_bmt_parse_bbt(ctypes.byref(table), descending, len(descending))
         bmt = model.bmt(REMAP)
@@ -189,7 +304,7 @@ class Translation(unittest.TestCase):
                 ([], [(64, TOTAL)], 'RANGE'), ([], [(TOTAL, SYSTEM)], 'RANGE'),
                 ([], [(TOTAL - 1, SYSTEM)], 0)]:
             table = Table()
-            self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL)
+            self.lib.airoha_bmt_set_geometry(ctypes.byref(table), TOTAL, POOL)
             first, second = model.bbt(bbt), model.bmt(bmt)
             status = self.lib.airoha_bmt_parse_bbt(ctypes.byref(table), first, len(first)) or \
                 self.lib.airoha_bmt_parse_bmt(ctypes.byref(table), second, len(second))
@@ -216,15 +331,17 @@ class TableWriting(unittest.TestCase):
 
     def test_harnesses_pass(self):
         with tempfile.TemporaryDirectory() as work:
-            for name in ('write_contract', 'publication', 'remap'):
-                with self.subTest(name):
-                    result = compile_and_run(
-                        [CC, '-DAIROHA_BMT_HOST', '-std=c11', '-O1', '-g', '-Wall', '-Wextra',
-                         '-Werror', '-fsanitize=undefined', '-fno-sanitize-recover=all',
-                         f'-I{BMT}', BMT / f'tests/{name}.c', BMT / 'airoha_bmt.c',
-                         BMT / 'airoha_bmt_write.c', BMT / 'airoha_bmt_transaction.c',
-                         '-lcrypto'], Path(work) / name)
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for part, include in policy_headers(work).items():
+                for name in ('write_contract', 'publication', 'remap'):
+                    with self.subTest(part=part, harness=name):
+                        result = compile_and_run(
+                            [CC, '-DAIROHA_BMT_HOST', '-std=c11', '-O1', '-g', '-Wall',
+                             '-Wextra', '-Werror', '-fsanitize=undefined',
+                             '-fno-sanitize-recover=all', f'-I{include}', f'-I{BMT}',
+                             BMT / f'tests/{name}.c', BMT / 'airoha_bmt.c',
+                             BMT / 'airoha_bmt_write.c', BMT / 'airoha_bmt_transaction.c',
+                             '-lcrypto'], include / name, timeout=300)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 def function(source, signature):
@@ -248,7 +365,7 @@ class Bindings(unittest.TestCase):
     def setUpClass(cls):
         cls.work = tempfile.TemporaryDirectory()
         out = Path(cls.work.name)
-        (out / 'airoha_bmt_policy.h').write_text(partitions.policy_header())
+        cls.includes = policy_headers(out)
         core = (LINUX_SRC / 'drivers/mtd/nand/spi/core.c').read_text()
         start = core.index('static int spinand_probe(')
         probe = core[start:core.index('static const struct spi_device_id', start)]
@@ -265,11 +382,11 @@ class Bindings(unittest.TestCase):
     def tearDownClass(cls):
         cls.work.cleanup()
 
-    def command(self, layer, linux):
+    def command(self, layer, linux, part):
         command = [CC, '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                    '-fsanitize=undefined', '-fno-sanitize-recover=all',
-                   f'-I{BMT / "tests/include"}', f'-I{BMT}', f'-I{self.out}',
-                   f'-DLAYER_FILE="{layer}"']
+                   f'-I{BMT / "tests/include"}', f'-I{self.includes[part]}', f'-I{BMT}',
+                   f'-I{self.out}', f'-DLAYER_FILE="{layer}"']
         return command + (['-DTEST_LINUX'] if linux else [])
 
     def ubi_consumer(self, name, tree):
@@ -290,18 +407,21 @@ class Bindings(unittest.TestCase):
 
     def check_binding(self, name, layer, tree, write_config):
         linux = name == 'linux'
-        result = compile_and_run(self.command(layer, linux) +
-                                 [BMT / 'tests/bindings.c', BMT / 'airoha_bmt.c'],
-                                 self.out / name, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         include = self.ubi_consumer(name, tree)
-        result = compile_and_run(
-            self.command(layer, linux) +
-            [f'-D{write_config}=1', '-DAIROHA_BMT_HOST', f'-DUBI_CONSUMER_FILE="{include}"',
-             BMT / 'tests/managed_bindings.c', BMT / 'airoha_bmt.c',
-             BMT / 'airoha_bmt_write.c', BMT / 'airoha_bmt_transaction.c', '-lcrypto',
-             '-pthread'], self.out / f'managed-{name}', timeout=60)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for part in partitions.PARTS:
+            with self.subTest(part=part):
+                result = compile_and_run(self.command(layer, linux, part) +
+                                         [BMT / 'tests/bindings.c', BMT / 'airoha_bmt.c'],
+                                         self.out / f'{name}-{part}', timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                result = compile_and_run(
+                    self.command(layer, linux, part) +
+                    [f'-D{write_config}=1', '-DAIROHA_BMT_HOST',
+                     f'-DUBI_CONSUMER_FILE="{include}"', BMT / 'tests/managed_bindings.c',
+                     BMT / 'airoha_bmt.c', BMT / 'airoha_bmt_write.c',
+                     BMT / 'airoha_bmt_transaction.c', '-lcrypto', '-pthread'],
+                    self.out / f'managed-{name}-{part}', timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_uboot_binding(self):
         self.check_binding('uboot', ROOT / 'platform/loader/airoha_bmt_layer.c', UBOOT_SRC,

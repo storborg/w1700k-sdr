@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT / 'platform'))
 import partitions  # noqa: E402  the NAND layout shared with the platform build
 
 IMAGES = ROOT / 'platform/build/images'
+# The NAND part the images are built for (platform/images.py writes it).
+NAND_PART = partitions.BUILT_PART
 LOADER = IMAGES / 'w1700k-loader.itb'
 DUMPER = IMAGES / 'w1700k-dumper.itb'
 SYSTEM_FIT = IMAGES / 'w1700k-system.itb'
@@ -106,3 +108,12 @@ def require_images(*paths):
     missing = [str(path) for path in paths if not Path(path).is_file()]
     if missing:
         raise SystemExit('missing build output: ' + ', '.join(missing) + '; run `make`')
+
+
+def require_part():
+    """The images must be built for the part the layout here describes."""
+    built = NAND_PART.read_text().strip() if NAND_PART.is_file() else None
+    if built != partitions.PART.name:
+        raise SystemExit(f'the images are built for {built or "an unrecorded NAND part"}, not '
+                         f'{partitions.PART.name}; rebuild with `make '
+                         f'W1700K_NAND={partitions.PART.name}`')

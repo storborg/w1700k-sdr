@@ -13,6 +13,7 @@ import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'init'))
+from initkit.config import partitions  # noqa: E402
 from initkit.uart import MUTATING  # noqa: E402
 
 PROMPTS = {'stock': 'ECNT> ', 'dumper': 'dumper> ', 'loader': 'SDR loader> ',
@@ -64,7 +65,8 @@ class FakeUnit:
         self.log = []                  # (state, command)
         self.chip_bytes = chip_bytes
         self.chip_probes = chip_probes
-        self.page_bytes, self.oob_bytes = 0x800, 128
+        # The chip of the part the images are built for.
+        self.page_bytes, self.oob_bytes = partitions.PAGE_BYTES, partitions.PART.oob
         self.allow_mutating = False
         self.buffer = ''
         self.catcher_armed = True

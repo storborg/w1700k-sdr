@@ -29,6 +29,7 @@ def run(settings, expect_serial=None, authorized_key=None, import_host_key=None,
     else:
         config.require_images(config.LOADER, config.DUMPER, config.SYSTEM_FIT,
                               config.ROOTFS, config.DURABLE)
+        config.require_part()
         provision.authorized_key(authorized_key)   # fail before touching the unit
     with open_session(settings, 'install', write=not backup_only) as session:
         console, log = session.console, session.log

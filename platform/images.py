@@ -20,6 +20,7 @@ The FITs are parsed only by our loader, so their hashes are SHA-256.
 import gzip
 import os
 from pathlib import Path
+import re
 import stat
 import struct
 import sys
@@ -29,7 +30,7 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from buildlib import (BUILD, BUILDROOT_OUT, DTB, IMAGES, KERNEL_IMAGE, LINUX_OUT,
-                      LOGS, MKIMAGE, PLATFORM, REPRODUCIBLE_ENV, ROOTFS_IMAGE, main_guard,
+                      LOGS, MKIMAGE, PLATFORM, REPRODUCIBLE_ENV, ROOTFS_IMAGE, SRC, main_guard,
                       require, run, write_if_changed)
 import fdt
 import partitions
@@ -201,9 +202,23 @@ def durable():
         write_if_changed(DURABLE, normalize_ubifs(raw.read_bytes()))
 
 
+def built_part(tree):
+    """The NAND part a prepared U-Boot or Linux tree was last configured for."""
+    header = tree / 'drivers/mtd/nand/airoha_bmt_policy.h'
+    found = re.search(r'#define BMT_PART "([^"]+)"', header.read_text()) \
+        if header.is_file() else None
+    return found.group(1) if found else None
+
+
 def main():
     for path in (KERNEL_IMAGE, DTB, ROOTFS_IMAGE, BUSYBOX, MKIMAGE):
         require(path.is_file(), f'{path} is missing; build it first (see the top-level Makefile)')
+    # The loader and the kernel compile the BMT engine for one NAND part; the
+    # images and the installer must use the same one.
+    for tree in (SRC / 'u-boot-loader', SRC / 'linux'):
+        require(built_part(tree) == partitions.PART.name,
+                f'{tree} is built for {built_part(tree)}, not {partitions.PART.name}; '
+                f'run `make W1700K_NAND={partitions.PART.name}`')
     IMAGES.mkdir(parents=True, exist_ok=True)
     root = ROOTFS_IMAGE.read_bytes()
     require(len(root) <= partitions.ROOTFS_VOLUME_BYTES, 'the root does not fit its volume')
@@ -215,8 +230,10 @@ def main():
             'the system FIT does not fit its volume')
     build_fit(RECOVERY_FIT, 'W1700K SDR recovery', RECOVERY_INITRD)
     durable()
+    write_if_changed(partitions.BUILT_PART, partitions.PART.name + '\n')
     for path in (SYSTEM_FIT, ROOTFS, RECOVERY_FIT, DURABLE):
         print(f'images: {path} ({path.stat().st_size} bytes)')
+    print(f'images: built for the {partitions.PART.name}')
     return 0
 
 

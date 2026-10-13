@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import shutil
 
+from .config import partitions
 from .console import StepFailed, command
 from .log import sha256_file
 
@@ -37,10 +38,6 @@ EEPROM_OFFSET = 0x405000
 EEPROM_BYTES = 0x4000
 EEPROM_NAME = 'eeprom.bin'
 EEPROM_CHIP_ID = b'\x90\x79'      # 0x7990, little-endian, at the start of the image
-# The part everything after the backup is built for (the W25N04KV): the loader,
-# the BMT engine and Linux all assume this geometry.
-PLATFORM_PAGE_BYTES = 0x800
-PLATFORM_OOB_BYTES = 128
 DUMP_BUFFER = 0x90000000
 DUMP_BYTES = 0x22000000
 BACKUP_NAME = 'nand-raw.bin'
@@ -119,17 +116,17 @@ def geometry(listing):
 
 
 def check_platform_part(console):
-    """Refuse to go on to writing unless the chip has the platform's geometry.
-
-    Other parts fitted to this board (2048 blocks of 4 KiB pages) can be backed
-    up, but the BMT engine would misread their vendor tables.
-    """
+    """Refuse to go on to writing unless the chip is the part the loader, the BMT
+    engine and Linux are built for (platform/partitions.py)."""
     found = geometry(console.must_run('mtd list', limit=30))
-    if (found['page_bytes'], found['oob_bytes']) != (PLATFORM_PAGE_BYTES, PLATFORM_OOB_BYTES):
-        raise StepFailed(f'this chip has {found["page_bytes"]}-byte pages and '
-                         f'{found["oob_bytes"]} bytes of OOB; the loader, BMT and Linux are '
-                         f'built for {PLATFORM_PAGE_BYTES} and {PLATFORM_OOB_BYTES}. The backup '
-                         'is kept; nothing was written')
+    seen = (found['page_bytes'], found['oob_bytes'])
+    if seen != (partitions.PAGE_BYTES, partitions.PART.oob):
+        names = [part.name for part in partitions.PARTS.values() if (part.page, part.oob) == seen]
+        hint = f'; this unit needs images built with W1700K_NAND={names[0]}' if names else ''
+        raise StepFailed(f'this chip has {seen[0]}-byte pages and {seen[1]} bytes of OOB; '
+                         f'the images are built for the {partitions.PART.name} '
+                         f'({partitions.PAGE_BYTES} and {partitions.PART.oob}){hint}. '
+                         'The backup is kept; nothing was written')
 
 
 def check_read_only(listing):

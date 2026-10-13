@@ -39,21 +39,52 @@ airoha_u32 airoha_bmt_clamped_pool(airoha_u32 total_blocks)
 	/* When the scan floor already exceeds the 250-entry capacity, every pool
 	 * that survives the ceiling is clamped to the capacity, so the extent is
 	 * pinned without reading the unit. On a smaller part the clamp may not
-	 * fire and the extent must come from elsewhere; we report 0 (unpinnable)
-	 * and refuse rather than guess. */
+	 * fire and only the scan gives the pool. */
 	if (airoha_bmt_pool_floor(total_blocks) > AIROHA_BMT_MAX_ENTRIES)
 		return AIROHA_BMT_MAX_ENTRIES;
 	return 0;
 }
 
-int airoha_bmt_set_geometry(struct airoha_bmt *t, airoha_u32 total_blocks)
+int airoha_bmt_pool_scan(airoha_u32 total_blocks,
+			 int (*factory_bad)(void *ctx, airoha_u32 block), void *ctx,
+			 airoha_u32 *pool)
 {
-	airoha_u32 pool = airoha_bmt_clamped_pool(total_blocks);
+	/* Stock 0x81e1b5e8; the ceiling and clamp are its caller's, 0x81e1b68c. */
+	airoha_u32 target = airoha_bmt_pool_floor(total_blocks) & 0xffff;
+	airoha_u32 cursor, good = 0, measured = total_blocks;
+	int bad;
+
+	if (!total_blocks || total_blocks > 0xffff)
+		return AIROHA_BMT_E_RANGE;
+	for (cursor = total_blocks - 1; cursor; cursor--) {
+		bad = factory_bad(ctx, cursor);
+		if (bad < 0)
+			return bad;
+		if (!bad && ++good == target) {
+			measured = total_blocks - cursor;
+			break;
+		}
+	}
+	if (measured > airoha_bmt_pool_ceiling(total_blocks))
+		return AIROHA_BMT_E_UNPINNABLE;
+	*pool = measured > AIROHA_BMT_MAX_ENTRIES ? AIROHA_BMT_MAX_ENTRIES : measured;
+	return AIROHA_BMT_OK;
+}
+
+int airoha_bmt_set_geometry(struct airoha_bmt *t, airoha_u32 total_blocks,
+			    airoha_u32 pool)
+{
+	airoha_u32 least = airoha_bmt_pool_floor(total_blocks);
 
 	memset(t, 0, sizeof(*t));
 	if (total_blocks > 0xffff)
 		return AIROHA_BMT_E_RANGE;
-	if (!pool)
+	if (least > AIROHA_BMT_MAX_ENTRIES)
+		least = AIROHA_BMT_MAX_ENTRIES;
+	/* The scan never returns less than its target, nor more than the
+	 * ceiling or the capacity. */
+	if (!least || pool < least || pool > AIROHA_BMT_MAX_ENTRIES ||
+	    pool > airoha_bmt_pool_ceiling(total_blocks))
 		return AIROHA_BMT_E_UNPINNABLE;
 	t->total_blocks = (airoha_u16)total_blocks;
 	t->system_blocks = (airoha_u16)(total_blocks - pool);
@@ -121,18 +152,17 @@ int airoha_bmt_parse_bmt(struct airoha_bmt *t, const airoha_u8 *page, airoha_u32
 	version = page[3];
 	size = page[5];
 	stored = page[6];
+	/* The extent is a runtime global the table does not carry: the pool
+	 * stock measured at boot, which set_geometry recorded. The vendor table
+	 * has one entry per pool block and zeroes exactly those; a table
+	 * matching any other extent is refused, since the vendor could not have
+	 * written one, so it is a bad read. */
+	pool = t->total_blocks - t->system_blocks;
 	if (!version)
 		return AIROHA_BMT_E_VERSION;
-	if (size > AIROHA_BMT_MAX_ENTRIES)
+	if (size > pool)
 		return AIROHA_BMT_E_SIZE;
-	/* The extent is a runtime global the table does not carry, but the clamp
-	 * before its one writer always fires on this geometry, so it is the whole
-	 * entry area. A table matching any other extent is refused: the vendor
-	 * could not have written one, so it is a bad read. */
-	pool = airoha_bmt_clamped_pool(t->total_blocks);
-	if (!pool)
-		return AIROHA_BMT_E_UNPINNABLE;
-	end = AIROHA_BMT_HEADER + 4 * pool;		/* == AIROHA_BMT_BYTES */
+	end = AIROHA_BMT_HEADER + 4 * pool;		/* <= AIROHA_BMT_BYTES */
 	computed = (airoha_u32)version + size;
 	for (i = AIROHA_BMT_HEADER; i < end; i++)
 		computed += page[i];

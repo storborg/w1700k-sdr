@@ -5,10 +5,15 @@
 #define AIROHA_BMT_WRITE_H
 
 #include "airoha_bmt.h"
+#include "airoha_bmt_policy.h"
 
-#define AIROHA_WRITE_PAGE 2048u
-#define AIROHA_WRITE_BLOCK 131072u
-#define AIROHA_WRITE_OOB 56u
+/* The part the image is built for (platform/partitions.py). The reserve pool,
+ * and with it system_blocks, is measured at attach and read from the map. */
+#define AIROHA_WRITE_PAGE BMT_PAGE_BYTES
+#define AIROHA_WRITE_PAGES BMT_BLOCK_PAGES
+#define AIROHA_WRITE_BLOCK (BMT_PAGE_BYTES * BMT_BLOCK_PAGES)
+#define AIROHA_WRITE_OOB BMT_OOB_FREE
+#define AIROHA_WRITE_TOTAL BMT_TOTAL_BLOCKS
 #define AIROHA_INTENT_BYTES 240u
 #define AIROHA_RETIRE_ATTEMPTS 3u
 
@@ -28,6 +33,7 @@ enum airoha_write_operation {
  * silently exceed the NAND's four-program limit (one table + at most 3 marks).
  */
 struct airoha_bmt_intent {
+	airoha_u16 system_blocks;	/* the map's; implicit in a version 3 record */
 	airoha_u16 operation;
 	airoha_u16 journal_block;
 	airoha_u16 candidate_block;
@@ -45,8 +51,9 @@ struct airoha_bmt_intent {
 	/* Reserve-index bitmap captured after a full erased-state inventory.
 	 * It identifies blocks this one serialized transaction may have dirtied
 	 * during interrupted metadata retries. Existing data/tables have zero
-	 * bits; candidate and journal were free and have one bits. Bits 250..255
-	 * are zero. It does not authorize ordinary master writes to the pool. */
+	 * bits; candidate and journal were free and have one bits. Bit i is block
+	 * system_blocks + i; bits from the pool size up are zero. It does not
+	 * authorize ordinary master writes to the pool. */
 	airoha_u8 free_pool[32];
 	/* Complete canonical preimage for PROGRAM. Allows safe abort when reset
 	 * interrupts the stage before original I/O; ERASE does not need old data. */

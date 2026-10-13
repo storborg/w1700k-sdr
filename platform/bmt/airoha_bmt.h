@@ -12,9 +12,10 @@
  *
  * This is not OpenWrt's mtk_bmt: that computes an unclamped reserve pool, fails
  * the checksum of a vendor-written BMT, and then erases and rewrites the table.
- * This core clamps the pool to the table capacity, checks the whole 1000-byte
- * checksum extent, and refuses a table that does not validate. It never
- * writes; replacement lives in airoha_bmt_write.c and airoha_bmt_transaction.c.
+ * This core measures the pool as stock does, clamps it to the table capacity,
+ * checks the whole checksum extent (4 bytes per pool block), and refuses a
+ * table that does not validate. It never writes; replacement lives in
+ * airoha_bmt_write.c and airoha_bmt_transaction.c.
  */
 #ifndef AIROHA_BMT_H
 #define AIROHA_BMT_H
@@ -51,9 +52,9 @@ enum {
 	AIROHA_BMT_E_SHORT = -1,	/* buffer smaller than the table */
 	AIROHA_BMT_E_SIGNATURE = -2,	/* wrong magic */
 	AIROHA_BMT_E_VERSION = -3,	/* zero version; no vendor writer makes one */
-	AIROHA_BMT_E_SIZE = -4,		/* entry count exceeds the 250 capacity */
+	AIROHA_BMT_E_SIZE = -4,		/* entry count exceeds the table capacity */
 	AIROHA_BMT_E_CHECKSUM = -5,	/* checksum mismatch at the pinned extent */
-	AIROHA_BMT_E_UNPINNABLE = -6,	/* geometry too small to pin the extent */
+	AIROHA_BMT_E_UNPINNABLE = -6,	/* no pool stock could have measured */
 	AIROHA_BMT_E_RANGE = -7,	/* block outside the device after mapping */
 	AIROHA_BMT_E_ORDER = -8,	/* BBT not strictly ascending */
 	AIROHA_BMT_E_NOTLOADED = -9,	/* translate before both tables parsed */
@@ -61,7 +62,7 @@ enum {
 
 struct airoha_bmt {
 	airoha_u16 total_blocks;	/* whole chip, e.g. 4096 */
-	airoha_u16 system_blocks;	/* total minus the clamped pool (e.g. 3846) */
+	airoha_u16 system_blocks;	/* total minus the pool (e.g. 3846) */
 	airoha_u8 geometry_set;
 	airoha_u8 bbt_loaded;
 	airoha_u8 bmt_loaded;
@@ -76,13 +77,27 @@ struct airoha_bmt {
 /* The reserve pool size of a part with `total_blocks` blocks. */
 airoha_u32 airoha_bmt_pool_floor(airoha_u32 total_blocks);
 airoha_u32 airoha_bmt_pool_ceiling(airoha_u32 total_blocks);
-/* The clamped pool, or 0 when the geometry cannot pin it (part < ~3138 blocks). */
+/* The clamped pool when the geometry alone pins it (parts of >= ~3138 blocks),
+ * else 0: then only the scan below gives it. */
 airoha_u32 airoha_bmt_clamped_pool(airoha_u32 total_blocks);
 
-/* Set total_blocks and derive system_blocks from the clamped pool. Must precede
- * parse_bmt (the checksum extent depends on the clamp) and translate. Returns
- * AIROHA_BMT_E_UNPINNABLE when the geometry cannot pin the pool. */
-int airoha_bmt_set_geometry(struct airoha_bmt *t, airoha_u32 total_blocks);
+/* The pool exactly as stock U-Boot measures it at every boot: count down from
+ * the last block (block 0 is never examined) until total*8/100 blocks without
+ * a factory-bad marker have been seen; the pool is total minus that block.
+ * factory_bad(ctx, block) returns 1 when the block's first-page OOB byte 0 is
+ * not 0xff (worn markers in byte 1 do not count), 0, or a negative error,
+ * which is returned unchanged. A pool above total/8 fails stock's BMT init
+ * (AIROHA_BMT_E_UNPINNABLE); otherwise it is clamped to the table capacity. */
+int airoha_bmt_pool_scan(airoha_u32 total_blocks,
+			 int (*factory_bad)(void *ctx, airoha_u32 block), void *ctx,
+			 airoha_u32 *pool);
+
+/* Set total_blocks and derive system_blocks from the pool airoha_bmt_pool_scan
+ * measured. Must precede parse_bmt (the checksum extent is the pool) and
+ * translate. Returns AIROHA_BMT_E_UNPINNABLE for a pool stock cannot have
+ * measured on this part. */
+int airoha_bmt_set_geometry(struct airoha_bmt *t, airoha_u32 total_blocks,
+			    airoha_u32 pool);
 
 /* Parse one table from the first page of its reserve block. Idempotent; the
  * parse functions only read the buffer. */

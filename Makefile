@@ -8,9 +8,14 @@
 # compiles a cross toolchain: about ten minutes on a 20-core host plus downloads;
 # later builds are incremental.
 # JOBS=N limits parallel compile jobs (default: all CPUs).
+# W1700K_NAND=w25n04l builds for units with that NAND part instead of the W25N04KV;
+# later builds keep the part the last images were built for until it is set again.
 
 PYTHON ?= python3
 export PYTHONDONTWRITEBYTECODE := 1
+# The unit's 512 MiB SPI-NAND part: w25n04kv (default) or w25n04l. The installer's
+# backup step names the one a unit carries.
+export W1700K_NAND
 
 .PHONY: all toolchain linux sdr rootfs loader dumper images firmware host check \
 	clean distclean

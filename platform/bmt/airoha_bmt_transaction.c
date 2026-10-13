@@ -9,10 +9,17 @@
 static int readable(int rc) { return rc >= 0 || rc == -EUCLEAN; }
 static int all_ff(const airoha_u8 *p, airoha_u32 n)
 { while (n--) if (*p++ != 255) return 0; return 1; }
+/* Reserve indices count from the measured system_blocks. */
+#define SYSTEM(w) ((airoha_u32)(w)->map->system_blocks)
+#define POOL(w) (AIROHA_WRITE_TOTAL - SYSTEM(w))
 static int free_bit(const struct airoha_bmt_intent *r, airoha_u32 b)
-{ return b >= 3846 && b < 4096 && ((r->free_pool[(b-3846)/8] >> ((b-3846)%8)) & 1); }
+{
+	airoha_u32 i = b - r->system_blocks;
+	return b >= r->system_blocks && b < AIROHA_WRITE_TOTAL &&
+	       ((r->free_pool[i/8] >> (i%8)) & 1);
+}
 static void role(struct airoha_bmt_transaction *w, airoha_u32 b, airoha_u8 value)
-{ if (b >= 3846 && b < 4096) w->pool[b-3846] = value; }
+{ if (b >= SYSTEM(w) && b < AIROHA_WRITE_TOTAL) w->pool[b-SYSTEM(w)] = value; }
 
 static int bad(struct airoha_bmt_transaction *w, airoha_u32 b)
 {
@@ -25,7 +32,7 @@ static int blank(struct airoha_bmt_transaction *w, airoha_u32 b)
 {
 	airoha_u32 p;
 	int rc;
-	for (p=0; p<64; p++) {
+	for (p=0; p<AIROHA_WRITE_PAGES; p++) {
 		rc = w->io.metadata.erased(w->io.metadata.ctx, b, p);
 		if (rc != 1) return rc < 0 ? rc : 0;
 	}
@@ -42,7 +49,7 @@ static int read_image(struct airoha_bmt_transaction *w, airoha_u32 b,
 {
 	airoha_u32 p, backref;
 	int rc;
-	for (p=0; p<64; p++) {
+	for (p=0; p<AIROHA_WRITE_PAGES; p++) {
 		airoha_u8 *data = image + p*AIROHA_IMAGE_STRIDE;
 		rc = w->io.read_data(w->io.metadata.ctx,b,p,data,data+AIROHA_WRITE_PAGE);
 		if (!readable(rc)) return rc;
@@ -101,7 +108,7 @@ static int load_journal(struct airoha_bmt_transaction *w)
 	if (rc) return 0;
 	rc=w->io.metadata.read_page(w->io.metadata.ctx,w->journal_block,0,w->actual);
 	if (!readable(rc)) return rc;
-	rc=airoha_bmt_intent_decode(&w->pending,w->actual,2048,w->io.metadata.hash);
+	rc=airoha_bmt_intent_decode(&w->pending,w->actual,AIROHA_WRITE_PAGE,w->io.metadata.hash);
 	if (rc) return rc; /* known journal: never classify torn/corrupt bytes as free */
 	if (w->pending.journal_block!=w->journal_block ||
 	    w->pending.bbt_block!=w->bbt_block ||
@@ -117,7 +124,7 @@ static int inventory(struct airoha_bmt_transaction *w)
 {
 	airoha_u32 b, i;
 	int rc;
-	for (b=3846;b<4096;b++) {
+	for (b=SYSTEM(w);b<AIROHA_WRITE_TOTAL;b++) {
 		role(w,b,AIROHA_POOL_UNKNOWN);
 		rc=bad(w,b);
 		if (rc<0) return rc;
@@ -138,8 +145,8 @@ static int inventory(struct airoha_bmt_transaction *w)
 			return rc;
 		}
 		w->scratch=*w->map;
-		if (!airoha_bmt_parse_bmt(&w->scratch,w->actual,2048) ||
-		    !airoha_bmt_parse_bbt(&w->scratch,w->actual,2048))
+		if (!airoha_bmt_parse_bmt(&w->scratch,w->actual,AIROHA_WRITE_PAGE) ||
+		    !airoha_bmt_parse_bbt(&w->scratch,w->actual,AIROHA_WRITE_PAGE))
 			role(w,b,AIROHA_POOL_TABLE);
 		/* Unknown nonempty storage is quarantined, never presumed abandoned.
 		 * A configured journal cannot disappear into this category. */
@@ -159,7 +166,8 @@ int airoha_bmt_transaction_init(struct airoha_bmt_transaction *w,
 	    !io->metadata.program_page || !io->metadata.erase || !io->metadata.erased ||
 	    !io->metadata.markers || !io->metadata.retire || !io->metadata.hash ||
 	    airoha_bmt_write_validate(map,first,end,bbt_block,bmt_block) ||
-	    journal_block<3846 || journal_block>=bmt_block || journal_block==bbt_block)
+	    journal_block<map->system_blocks || journal_block>=bmt_block ||
+	    journal_block==bbt_block)
 		return -EINVAL;
 	for(i=0;i<map->bmt_size;i++)
 		if(map->bmt_to[i]==journal_block || map->bmt_to[i]>=bmt_block) return -EINVAL;
@@ -185,10 +193,11 @@ static int cancel_metadata(struct airoha_bmt_transaction *w)
 {
 	airoha_u32 b;
 	int rc;
-	for(b=3846;b<w->pending.old_table_block;b++) {
+	for(b=SYSTEM(w);b<w->pending.old_table_block;b++) {
 		if(!free_bit(&w->pending,b) || b==w->journal_block ||
 		   b==w->pending.candidate_block || b==w->bmt_block) continue;
-		if(w->pool[b-3846]==AIROHA_POOL_FREE || w->pool[b-3846]==AIROHA_POOL_BAD) continue;
+		if(w->pool[b-SYSTEM(w)]==AIROHA_POOL_FREE ||
+		   w->pool[b-SYSTEM(w)]==AIROHA_POOL_BAD) continue;
 		rc=erase_checked(w,b);
 		if(rc) return rc;
 		role(w,b,AIROHA_POOL_FREE);
@@ -297,7 +306,8 @@ static int validate_change(struct airoha_bmt_transaction *w, const struct airoha
 	airoha_u32 i;
 	if(c->logical<w->first || c->logical>=w->end) return -EROFS;
 	if(c->offset>AIROHA_WRITE_BLOCK || c->length>AIROHA_WRITE_BLOCK-c->offset ||
-	   c->oob_offset>64*AIROHA_WRITE_OOB || c->oob_length>64*AIROHA_WRITE_OOB-c->oob_offset ||
+	   c->oob_offset>AIROHA_WRITE_PAGES*AIROHA_WRITE_OOB ||
+	   c->oob_length>AIROHA_WRITE_PAGES*AIROHA_WRITE_OOB-c->oob_offset ||
 	   (c->length && !c->data) || (c->oob_length && !c->oob) ||
 	   (c->erase && (c->length || c->oob_length))) return -EINVAL;
 	for(i=0;i<c->oob_length;i++)
@@ -308,16 +318,16 @@ static int validate_change(struct airoha_bmt_transaction *w, const struct airoha
 static int allocate(struct airoha_bmt_transaction *w)
 {
 	airoha_u32 n, b, i, high, meta;
-	for(n=0;n<250;n++) {
-		i=(w->cursor+n)%250; b=3846+i;
+	for(n=0;n<POOL(w);n++) {
+		i=(w->cursor+n)%POOL(w); b=SYSTEM(w)+i;
 		if(w->pool[i]!=AIROHA_POOL_FREE || b>=w->bmt_block || b==w->journal_block) continue;
 		high=b>w->journal_block ? b : w->journal_block;
 		for(meta=0;meta<w->map->bmt_size;meta++)
 			if(w->map->bmt_to[meta]>high) high=w->map->bmt_to[meta];
 		for(meta=w->bmt_block;meta-- > high+1;)
-			if(w->pool[meta-3846]==AIROHA_POOL_FREE) break;
+			if(w->pool[meta-SYSTEM(w)]==AIROHA_POOL_FREE) break;
 		if(meta<=high) continue;
-		w->cursor=(i+1)%250;
+		w->cursor=(i+1)%POOL(w);
 		return b;
 	}
 	return -ENOSPC;
@@ -331,26 +341,29 @@ static int prepare_record(struct airoha_bmt_transaction *w, const struct airoha_
 	int source=airoha_bmt_translate(w->map,c->logical), shift=airoha_bmt_shift(w->map,c->logical);
 	if(source<0 || shift<0) return -EINVAL;
 	memset(r,0,sizeof *r);
+	r->system_blocks=w->map->system_blocks;
 	r->operation=c->erase ? AIROHA_INTENT_ERASE : AIROHA_INTENT_PROGRAM;
 	r->journal_block=w->journal_block; r->candidate_block=stage;
 	r->logical_block=c->logical; r->system_key=c->logical+shift; r->old_physical=source;
 	r->old_table_block=w->bmt_block; r->bbt_block=w->bbt_block;
 	r->bbt_size=w->map->bbt_size; r->bmt_size=w->map->bmt_size;
 	r->old_mapping_present=(airoha_u32)source!=r->system_key;
-	for(i=0;i<250;i++) if(w->pool[i]==AIROHA_POOL_FREE)
+	for(i=0;i<POOL(w);i++) if(w->pool[i]==AIROHA_POOL_FREE)
 		r->free_pool[i/8]|=1u<<(i%8);
-	i=w->journal_block-3846; r->free_pool[i/8]|=1u<<(i%8);
+	i=w->journal_block-SYSTEM(w); r->free_pool[i/8]|=1u<<(i%8);
 	memcpy(r->preimage_digest,before,32);
-	airoha_bmt_encode(w->map,w->expected,2048); w->io.metadata.hash(w->expected,1020,r->bmt_digest);
-	airoha_bbt_encode(w->map,w->expected,2048); w->io.metadata.hash(w->expected,512,r->bbt_digest);
+	airoha_bmt_encode(w->map,w->expected,AIROHA_WRITE_PAGE);
+	w->io.metadata.hash(w->expected,AIROHA_BMT_BYTES,r->bmt_digest);
+	airoha_bbt_encode(w->map,w->expected,AIROHA_WRITE_PAGE);
+	w->io.metadata.hash(w->expected,AIROHA_BBT_BYTES,r->bbt_digest);
 	w->io.metadata.hash(w->image,AIROHA_IMAGE_BYTES,r->data_digest);
-	return airoha_bmt_intent_encode(r,w->expected,2048,w->io.metadata.hash);
+	return airoha_bmt_intent_encode(r,w->expected,AIROHA_WRITE_PAGE,w->io.metadata.hash);
 }
 
 static int write_journal(struct airoha_bmt_transaction *w)
 {
 	/* Erase immediately before the WAL write. Controller status replaces a
-	 * 64-page blank scan; the programmed record is read back below. */
+	 * blank scan of every page; the programmed record is read back below. */
 	int rc=erase_checked(w,w->journal_block);
 	if(rc) return rc;
 	rc=w->io.metadata.program_page(w->io.metadata.ctx,w->journal_block,0,w->expected);
@@ -359,16 +372,16 @@ static int write_journal(struct airoha_bmt_transaction *w)
 	if(rc) return rc<0 ? rc : -EIO;
 	rc=w->io.metadata.read_page(w->io.metadata.ctx,w->journal_block,0,w->actual);
 	if(!readable(rc)) return rc;
-	return memcmp(w->expected,w->actual,2048) ? -EIO : 0;
+	return memcmp(w->expected,w->actual,AIROHA_WRITE_PAGE) ? -EIO : 0;
 }
 
 static int program_image_page(struct airoha_bmt_transaction *w, airoha_u32 b,
 		airoha_u32 page, airoha_u32 *written, airoha_u32 *oobwritten)
 {
-	airoha_u8 oob[56];
+	airoha_u8 oob[AIROHA_WRITE_OOB];
 	const airoha_u8 *data=w->image+page*AIROHA_IMAGE_STRIDE;
-	memcpy(oob,data+2048,56);
-	if(b>=3846) { oob[0]=w->pending.system_key; oob[1]=w->pending.system_key>>8; }
+	memcpy(oob,data+AIROHA_WRITE_PAGE,AIROHA_WRITE_OOB);
+	if(b>=SYSTEM(w)) { oob[0]=w->pending.system_key; oob[1]=w->pending.system_key>>8; }
 	*written=*oobwritten=0;
 	return w->io.program_data(w->io.metadata.ctx,b,page,data,oob,written,oobwritten);
 }
@@ -379,12 +392,13 @@ static int stage_image(struct airoha_bmt_transaction *w)
 	int rc=erase_checked(w,b);
 	role(w,b,AIROHA_POOL_STAGE);
 	if(rc) return rc;
-	if(w->pending.operation==AIROHA_INTENT_PROGRAM) for(p=0;p<64;p++) {
+	if(w->pending.operation==AIROHA_INTENT_PROGRAM) for(p=0;p<AIROHA_WRITE_PAGES;p++) {
 		/* Page zero supplies the vendor backreference even if its main is FF.
 		 * Other entirely empty pages stay erased for subsequent appends. */
 		if(p && all_ff(w->image+p*AIROHA_IMAGE_STRIDE,AIROHA_IMAGE_STRIDE)) continue;
 		rc=program_image_page(w,b,p,&written,&oobwritten);
-		if(rc || written!=2048 || oobwritten!=56) return rc<0 ? rc : -EIO;
+		if(rc || written!=AIROHA_WRITE_PAGE || oobwritten!=AIROHA_WRITE_OOB)
+			return rc<0 ? rc : -EIO;
 	}
 	/* Erase status is authoritative. Programmed candidates are read back once. */
 	return w->pending.operation==AIROHA_INTENT_ERASE ? 0 : pub_verify(w,&w->pending);
@@ -396,7 +410,10 @@ static airoha_u32 overlap(airoha_u32 a, airoha_u32 n, airoha_u32 b, airoha_u32 m
 	return end>first ? end-first : 0;
 }
 static int affected(const struct airoha_bmt_change *c, airoha_u32 p)
-{ return overlap(c->offset,c->length,p*2048,2048) || overlap(c->oob_offset,c->oob_length,p*56,56); }
+{
+	return overlap(c->offset,c->length,p*AIROHA_WRITE_PAGE,AIROHA_WRITE_PAGE) ||
+	       overlap(c->oob_offset,c->oob_length,p*AIROHA_WRITE_OOB,AIROHA_WRITE_OOB);
+}
 
 static int apply_original(struct airoha_bmt_transaction *w, const struct airoha_bmt_change *c,
 		struct airoha_bmt_progress *done)
@@ -407,12 +424,12 @@ static int apply_original(struct airoha_bmt_transaction *w, const struct airoha_
 	if(c->erase) return erase_checked(w,b);
 	/* Do not reprogram existing ECC, exceed partial-program budgets, or move
 	 * backwards through a used block. A non-erased target page is a remap. */
-	for(p=0;p<64;p++) if(affected(c,p)) {
+	for(p=0;p<AIROHA_WRITE_PAGES;p++) if(affected(c,p)) {
 		rc=w->io.metadata.erased(w->io.metadata.ctx,b,p);
 		if(rc!=1) return rc<0 ? rc : -EIO;
 	}
 	/* Even an erased early page cannot be programmed after a used later page. */
-	for(p=64;p-- > 0;) {
+	for(p=AIROHA_WRITE_PAGES;p-- > 0;) {
 		if(affected(c,p)) continue;
 		rc=w->io.metadata.erased(w->io.metadata.ctx,b,p);
 		if(rc<0) return rc;
@@ -422,12 +439,13 @@ static int apply_original(struct airoha_bmt_transaction *w, const struct airoha_
 			break;
 		}
 	}
-	for(p=0;p<64;p++) if(affected(c,p)) {
+	for(p=0;p<AIROHA_WRITE_PAGES;p++) if(affected(c,p)) {
 		rc=program_image_page(w,b,p,&written,&oobwritten);
-		if(written>2048 || oobwritten>56) return -EIO;
-		done->data+=overlap(c->offset,c->length,p*2048,written);
-		done->oob+=overlap(c->oob_offset,c->oob_length,p*56,oobwritten);
-		if(rc || written!=2048 || oobwritten!=56) return rc<0 ? rc : -EIO;
+		if(written>AIROHA_WRITE_PAGE || oobwritten>AIROHA_WRITE_OOB) return -EIO;
+		done->data+=overlap(c->offset,c->length,p*AIROHA_WRITE_PAGE,written);
+		done->oob+=overlap(c->oob_offset,c->oob_length,p*AIROHA_WRITE_OOB,oobwritten);
+		if(rc || written!=AIROHA_WRITE_PAGE || oobwritten!=AIROHA_WRITE_OOB)
+			return rc<0 ? rc : -EIO;
 	}
 	rc=read_image(w,b,w->pending.system_key,w->verify,digest);
 	if(rc) return rc;
@@ -456,7 +474,7 @@ int airoha_bmt_transaction_apply(struct airoha_bmt_transaction *w,
 		if(!rc) goto out;
 		if(rc!=-EIO && rc!=-EBADMSG) goto out;
 		memset(w->image,255,AIROHA_IMAGE_BYTES);
-		for(attempts=0;attempts<250;attempts++) {
+		for(attempts=0;attempts<AIROHA_BMT_MAX_ENTRIES;attempts++) {
 			stage=allocate(w); if(stage<0) { rc=stage; goto out; }
 			rc=prepare_record(w,c,stage,before); if(rc) goto out;
 			started=1; rc=write_journal(w); if(rc) goto out;
@@ -475,15 +493,15 @@ int airoha_bmt_transaction_apply(struct airoha_bmt_transaction *w,
 		rc=read_image(w,source,c->logical+shift,w->image,before);
 		if(rc) goto out;
 		for(i=0;i<c->length;i++) {
-			p=(c->offset+i)/2048; col=(c->offset+i)%2048;
+			p=(c->offset+i)/AIROHA_WRITE_PAGE; col=(c->offset+i)%AIROHA_WRITE_PAGE;
 			w->image[p*AIROHA_IMAGE_STRIDE+col]=c->data[i];
 		}
 		for(i=0;i<c->oob_length;i++) {
-			p=(c->oob_offset+i)/56; col=(c->oob_offset+i)%56;
-			w->image[p*AIROHA_IMAGE_STRIDE+2048+col]=c->oob[i];
+			p=(c->oob_offset+i)/AIROHA_WRITE_OOB; col=(c->oob_offset+i)%AIROHA_WRITE_OOB;
+			w->image[p*AIROHA_IMAGE_STRIDE+AIROHA_WRITE_PAGE+col]=c->oob[i];
 		}
 	}
-	for(attempts=0;attempts<250;attempts++) {
+	for(attempts=0;attempts<AIROHA_BMT_MAX_ENTRIES;attempts++) {
 		stage=allocate(w); if(stage<0) { rc=stage; goto out; }
 		rc=prepare_record(w,c,stage,before); if(rc) goto out;
 		started=1;
@@ -497,7 +515,7 @@ int airoha_bmt_transaction_apply(struct airoha_bmt_transaction *w,
 		rc=erase_checked(w,w->journal_block); if(rc) goto out;
 		w->has_pending=0;
 	}
-	if(attempts==250) { rc=-ENOSPC; goto out; }
+	if(attempts==AIROHA_BMT_MAX_ENTRIES) { rc=-ENOSPC; goto out; }
 	rc=apply_original(w,c,done);
 	if(rc==-EIO || rc==-EBADMSG) rc=publish(w);
 	else if(!rc) rc=finish(w,0);

@@ -73,6 +73,19 @@ static int raw_marker_bad(struct mtd_info *mtd, loff_t physical)
 	return markers[0]!=255 || markers[1]!=255;
 }
 
+/* The factory marker alone, as stock's pool scan reads it: OOB byte 0 of the
+ * block's first page. A worn marker in byte 1 does not change the pool. */
+static int raw_factory_bad(void *ctx, u32 block)
+{
+	struct mtd_info *mtd=ctx;
+	u8 marker;
+	struct mtd_oob_ops op={.mode=MTD_OPS_RAW,.ooblen=1,.oobbuf=&marker};
+	int rc=layer._read_oob(mtd,(loff_t)block<<layer.blk_shift,&op);
+	if(rc<0) return rc;
+	if(op.oobretlen!=1) return -EIO;
+	return marker!=255;
+}
+
 /* Data and OOB advance independently through the same NAND page iterator.
  * Bound BOTH lengths to this logical eraseblock before translating the next. */
 static int bmt_io(struct mtd_info *mtd, loff_t addr,
@@ -270,7 +283,7 @@ static int attach_unlocked(struct mtd_info *mtd)
 {
 	unsigned int shift = 0;
 	u32 erasesize = mtd->erasesize;
-	u32 total;
+	u32 total, pool;
 	u8 *page;
 	int ret;
 
@@ -297,7 +310,14 @@ static int attach_unlocked(struct mtd_info *mtd)
 	layer._block_isbad = mtd->_block_isbad;
 	layer._block_markbad = mtd->_block_markbad;
 
-	if (airoha_bmt_set_geometry(&layer.t, total))
+	/* The pool, and with it where the tables are and what the BMT checksum
+	 * covers, is what stock measured at this boot; measure it the same way. */
+	ret = airoha_bmt_pool_scan(total, raw_factory_bad, mtd, &pool);
+	if (ret == AIROHA_BMT_E_RANGE || ret == AIROHA_BMT_E_UNPINNABLE)
+		return -EINVAL;
+	if (ret)
+		return ret;
+	if (airoha_bmt_set_geometry(&layer.t, total, pool))
 		return -EINVAL;
 
 	page = malloc(mtd->writesize);
@@ -330,8 +350,8 @@ static int attach_unlocked(struct mtd_info *mtd)
 	mtd->_block_isbad=managed_isbad;
 	mtd->_block_markbad=managed_markbad;
 #endif
-	printf("airoha-bmt: attached (system_blocks=%u, bbt=%u, bmt=%u); markbad refused\n",
-	       layer.t.system_blocks, layer.t.bbt_size, layer.t.bmt_size);
+	printf("airoha-bmt: attached (system_blocks=%u, pool=%u, bbt=%u, bmt=%u); markbad refused\n",
+	       layer.t.system_blocks, pool, layer.t.bbt_size, layer.t.bmt_size);
 	return 0;
 }
 

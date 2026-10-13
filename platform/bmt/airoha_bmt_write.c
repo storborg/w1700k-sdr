@@ -6,7 +6,14 @@
 #include <linux/errno.h>
 #endif
 
-static const airoha_u8 intent_magic[8] = {'S','D','R','W','B','0','0','3'};
+/* Version 3 records predate measured pools: they carry the total as a u32
+ * and imply the pinned pool of a 4096-block part. They are still written for
+ * that geometry; every other geometry writes version 4, which carries the
+ * total and system_blocks as two u16 in the same place. */
+static const airoha_u8 intent_magic_v3[8] = {'S','D','R','W','B','0','0','3'};
+static const airoha_u8 intent_magic_v4[8] = {'S','D','R','W','B','0','0','4'};
+#define PINNED_TOTAL 4096u
+#define PINNED_SYSTEM (PINNED_TOTAL - AIROHA_BMT_MAX_ENTRIES)
 
 static void wr16(airoha_u8 *p, airoha_u32 v) { p[0] = v; p[1] = v >> 8; }
 static void wr32(airoha_u8 *p, airoha_u32 v)
@@ -15,12 +22,17 @@ static airoha_u32 rd16(const airoha_u8 *p) { return p[0] | (p[1] << 8); }
 static airoha_u32 rd32(const airoha_u8 *p)
 { return rd16(p) | (rd16(p + 2) << 16); }
 
+static airoha_u32 pool_of(const struct airoha_bmt *t)
+{
+	return t->total_blocks - t->system_blocks;
+}
+
 static int was_free(const struct airoha_bmt_intent *r, airoha_u32 physical)
 {
 	airoha_u32 index;
-	if (physical < 3846 || physical >= 4096)
+	if (physical < r->system_blocks || physical >= AIROHA_WRITE_TOTAL)
 		return 0;
-	index = physical - 3846;
+	index = physical - r->system_blocks;
 	return (r->free_pool[index / 8] >> (index % 8)) & 1;
 }
 
@@ -28,8 +40,10 @@ static int valid_map(const struct airoha_bmt *t)
 {
 	airoha_u32 i, j;
 	if (!t->geometry_set || !t->bbt_loaded || !t->bmt_loaded ||
-	    t->total_blocks != 4096 || t->system_blocks != 3846 ||
-	    !t->bbt_ascending || t->bbt_size > 250 || t->bmt_size > 250)
+	    t->total_blocks != AIROHA_WRITE_TOTAL || t->system_blocks >= t->total_blocks ||
+	    pool_of(t) > AIROHA_BMT_MAX_ENTRIES ||
+	    !t->bbt_ascending || t->bbt_size > AIROHA_BMT_MAX_ENTRIES ||
+	    t->bmt_size > pool_of(t))
 		return -EINVAL;
 	for (i = 0; i < t->bbt_size; i++)
 		if (t->bbt_entries[i] >= t->system_blocks ||
@@ -69,20 +83,23 @@ int airoha_bmt_write_validate(const struct airoha_bmt *t, airoha_u32 first,
 
 int airoha_bmt_encode(const struct airoha_bmt *t, airoha_u8 *page, airoha_u32 len)
 {
-	airoha_u32 i, sum;
+	airoha_u32 i, sum, end;
 	if (len < AIROHA_WRITE_PAGE || valid_map(t))
 		return -EINVAL;
+	/* As the vendor writes it: one zeroed entry per pool block, the rest of
+	 * the 250-entry area left 0xff, the checksum over the pool's entries. */
+	end = AIROHA_BMT_HEADER + 4 * pool_of(t);
 	memset(page, 0xff, AIROHA_WRITE_PAGE);
 	memcpy(page, "BMT", 3);
 	page[3] = 1;
 	page[5] = t->bmt_size;
-	memset(page + AIROHA_BMT_HEADER, 0, 1000);
+	memset(page + AIROHA_BMT_HEADER, 0, end - AIROHA_BMT_HEADER);
 	for (i = 0; i < t->bmt_size; i++) {
 		wr16(page + AIROHA_BMT_HEADER + 4 * i, t->bmt_from[i]);
 		wr16(page + AIROHA_BMT_HEADER + 4 * i + 2, t->bmt_to[i]);
 	}
 	sum = 1 + t->bmt_size;
-	for (i = AIROHA_BMT_HEADER; i < AIROHA_BMT_BYTES; i++)
+	for (i = AIROHA_BMT_HEADER; i < end; i++)
 		sum += page[i];
 	page[6] = sum;
 	return 0;
@@ -129,7 +146,7 @@ int airoha_bmt_replace(struct airoha_bmt *t, airoha_u32 logical, airoha_u32 cand
 	 * reserve self-entry quarantining the old destination. Stock translation
 	 * ignores reserve sources, but its allocator excludes EVERY destination.
 	 * Retirement therefore does not depend on erasing/programming a dead block. */
-	if (t->bmt_size == 250)
+	if (t->bmt_size == pool_of(t))
 		return -ENOSPC;
 	if (index == t->bmt_size) {
 		t->bmt_size++;
@@ -143,17 +160,28 @@ int airoha_bmt_replace(struct airoha_bmt *t, airoha_u32 logical, airoha_u32 cand
 	return 0;
 }
 
+static int in_pool(const struct airoha_bmt_intent *r, airoha_u32 block)
+{
+	return block >= r->system_blocks && block < AIROHA_WRITE_TOTAL;
+}
+
 static int valid_intent(const struct airoha_bmt_intent *r)
 {
+	airoha_u32 pool, i;
+	if (r->system_blocks >= AIROHA_WRITE_TOTAL ||
+	    AIROHA_WRITE_TOTAL - r->system_blocks > AIROHA_BMT_MAX_ENTRIES)
+		return -EINVAL;
+	pool = AIROHA_WRITE_TOTAL - r->system_blocks;
 	if ((r->operation != AIROHA_INTENT_PROGRAM && r->operation != AIROHA_INTENT_ERASE) ||
-	    r->bbt_size > 250 || r->bmt_size > 250 || r->old_mapping_present > 1 ||
-	    r->logical_block >= 3846 - r->bbt_size || r->system_key >= 3846 ||
+	    r->bbt_size > AIROHA_BMT_MAX_ENTRIES || r->bmt_size > pool ||
+	    r->old_mapping_present > 1 ||
+	    r->bbt_size > r->system_blocks ||
+	    r->logical_block >= r->system_blocks - r->bbt_size ||
+	    r->system_key >= r->system_blocks ||
 	    r->system_key < r->logical_block ||
 	    r->system_key - r->logical_block > r->bbt_size ||
-	    r->candidate_block < 3846 || r->candidate_block >= 4096 ||
-	    r->journal_block < 3846 || r->journal_block >= 4096 ||
-	    r->old_table_block < 3846 || r->old_table_block >= 4096 ||
-	    r->bbt_block < 3846 || r->bbt_block >= 4096 ||
+	    !in_pool(r, r->candidate_block) || !in_pool(r, r->journal_block) ||
+	    !in_pool(r, r->old_table_block) || !in_pool(r, r->bbt_block) ||
 	    r->candidate_block == r->journal_block ||
 	    r->candidate_block == r->old_table_block || r->candidate_block == r->bbt_block ||
 	    r->journal_block == r->old_table_block || r->journal_block == r->bbt_block ||
@@ -162,11 +190,14 @@ static int valid_intent(const struct airoha_bmt_intent *r)
 	    r->old_physical == r->old_table_block || r->old_physical == r->bbt_block)
 		return -EINVAL;
 	if (r->old_mapping_present)
-		if (r->old_physical < 3846 || r->old_physical >= 4096 || !r->bmt_size)
+		if (!in_pool(r, r->old_physical) || !r->bmt_size)
 			return -EINVAL;
 	if (!r->old_mapping_present && r->old_physical != r->system_key)
 		return -EINVAL;
-	if ((r->free_pool[31] & 0xfc) || !was_free(r, r->candidate_block) ||
+	for (i = pool; i < 8 * sizeof(r->free_pool); i++)
+		if ((r->free_pool[i / 8] >> (i % 8)) & 1)
+			return -EINVAL;
+	if (!was_free(r, r->candidate_block) ||
 	    !was_free(r, r->journal_block) || was_free(r, r->old_table_block) ||
 	    was_free(r, r->bbt_block) || was_free(r, r->old_physical))
 		return -EINVAL;
@@ -176,11 +207,12 @@ static int valid_intent(const struct airoha_bmt_intent *r)
 int airoha_bmt_intent_encode(const struct airoha_bmt_intent *r,
 		airoha_u8 *p, airoha_u32 len, airoha_sha256_fn hash)
 {
+	int v3 = AIROHA_WRITE_TOTAL == PINNED_TOTAL && r->system_blocks == PINNED_SYSTEM;
 	if (len < AIROHA_WRITE_PAGE || !hash || valid_intent(r))
 		return -EINVAL;
 	memset(p, 0xff, AIROHA_WRITE_PAGE);
-	memcpy(p, intent_magic, 8);
-	wr16(p + 8, 3);
+	memcpy(p, v3 ? intent_magic_v3 : intent_magic_v4, 8);
+	wr16(p + 8, v3 ? 3 : 4);
 	wr16(p + 10, r->operation);
 	wr16(p + 12, r->journal_block); wr16(p + 14, r->candidate_block);
 	wr16(p + 16, r->logical_block); wr16(p + 18, r->system_key);
@@ -191,7 +223,12 @@ int airoha_bmt_intent_encode(const struct airoha_bmt_intent *r,
 	memcpy(p + 64, r->bbt_digest, 32);
 	memcpy(p + 96, r->data_digest, 32);
 	wr32(p + 128, AIROHA_WRITE_BLOCK); wr32(p + 132, AIROHA_WRITE_PAGE);
-	wr32(p + 136, AIROHA_WRITE_OOB); wr32(p + 140, 4096);
+	wr32(p + 136, AIROHA_WRITE_OOB);
+	if (v3) {
+		wr32(p + 140, PINNED_TOTAL);
+	} else {
+		wr16(p + 140, AIROHA_WRITE_TOTAL); wr16(p + 142, r->system_blocks);
+	}
 	memcpy(p + 144, r->free_pool, 32);
 	memcpy(p + 176, r->preimage_digest, 32);
 	hash(p, 208, p + 208);
@@ -203,11 +240,18 @@ int airoha_bmt_intent_decode(struct airoha_bmt_intent *r,
 {
 	struct airoha_bmt_intent decoded;
 	airoha_u8 digest[32];
-	airoha_u32 i;
-	if (len < AIROHA_WRITE_PAGE || !hash || memcmp(p, intent_magic, 8) ||
-	    rd16(p + 8) != 3 || p[31] != 0xff ||
+	airoha_u32 i, system;
+	if (len < AIROHA_WRITE_PAGE || !hash || p[31] != 0xff ||
 	    rd32(p + 128) != AIROHA_WRITE_BLOCK || rd32(p + 132) != AIROHA_WRITE_PAGE ||
-	    rd32(p + 136) != AIROHA_WRITE_OOB || rd32(p + 140) != 4096)
+	    rd32(p + 136) != AIROHA_WRITE_OOB)
+		return -EINVAL;
+	if (!memcmp(p, intent_magic_v3, 8) && rd16(p + 8) == 3 &&
+	    AIROHA_WRITE_TOTAL == PINNED_TOTAL && rd32(p + 140) == PINNED_TOTAL)
+		system = PINNED_SYSTEM;
+	else if (!memcmp(p, intent_magic_v4, 8) && rd16(p + 8) == 4 &&
+		 rd16(p + 140) == AIROHA_WRITE_TOTAL)
+		system = rd16(p + 142);
+	else
 		return -EINVAL;
 	for (i = AIROHA_INTENT_BYTES; i < AIROHA_WRITE_PAGE; i++)
 		if (p[i] != 0xff)
@@ -216,6 +260,7 @@ int airoha_bmt_intent_decode(struct airoha_bmt_intent *r,
 	if (memcmp(digest, p + 208, 32))
 		return -EBADMSG;
 	memset(&decoded, 0, sizeof(decoded));
+	decoded.system_blocks = system;
 	decoded.operation = rd16(p + 10);
 	decoded.journal_block = rd16(p + 12); decoded.candidate_block = rd16(p + 14);
 	decoded.logical_block = rd16(p + 16); decoded.system_key = rd16(p + 18);
@@ -240,7 +285,8 @@ int airoha_bmt_intent_match(const struct airoha_bmt_intent *r,
 	airoha_u8 digest[32];
 	airoha_u32 i, index;
 	int mapped, shift;
-	if (!hash || valid_intent(r) || valid_map(t) || r->bbt_size != t->bbt_size)
+	if (!hash || valid_intent(r) || valid_map(t) || r->bbt_size != t->bbt_size ||
+	    r->system_blocks != t->system_blocks)
 		return -EINVAL;
 	shift = airoha_bmt_shift(t, r->logical_block);
 	if (shift < 0 || r->logical_block + shift != r->system_key)

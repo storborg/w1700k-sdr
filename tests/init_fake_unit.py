@@ -51,7 +51,7 @@ class Refused(Exception):
 
 
 class FakeUnit:
-    def __init__(self, served, chip_bytes=0x420000, installed=False):
+    def __init__(self, served, chip_bytes=0x420000, installed=False, chip_probes=True):
         self.served = Path(served)
         self.state = 'off'
         self.env = {'bootcmd': STOCK_BOOTCMD, 'ethaddr': '00:aa:bb:01:23:40'}
@@ -63,6 +63,8 @@ class FakeUnit:
         self.erased = []
         self.log = []                  # (state, command)
         self.chip_bytes = chip_bytes
+        self.chip_probes = chip_probes
+        self.page_bytes, self.oob_bytes = 0x800, 128
         self.allow_mutating = False
         self.buffer = ''
         self.catcher_armed = True
@@ -254,9 +256,14 @@ class FakeUnit:
         return 'Saving Environment to ECNT Flash...', 0
 
     def dumper_mtd(self, line, words):
+        if not self.chip_probes:
+            return ('spi_nand nand@0: unknown raw ID ef 8b 23 00\n'
+                    'mtd: nand@0 did not probe: -95\n'
+                    'MTD device spi-nand0 not found, ret -19'), 1
         if words[1] == 'list':
-            return (f'* spi-nand0\n  - flags: 0x0 (read-only)\n  - min I/O: 0x800 bytes\n'
-                    f'  - OOB size: 128 bytes\n'
+            return (f'* spi-nand0\n  - flags: 0x0 (read-only)\n'
+                    f'  - min I/O: {self.page_bytes:#x} bytes\n'
+                    f'  - OOB size: {self.oob_bytes} bytes\n'
                     f'  - 0x000000000000-0x{self.chip_bytes:012x} : "spi-nand0"'), 0
         if words[1] == 'bad':
             return '', 0

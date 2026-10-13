@@ -1,0 +1,68 @@
+SPDX-License-Identifier: GPL-2.0+
+Subject: [PATCH] mtd: spinand: winbond: add the W25N04L (ID 0xef 0x8b 0x23)
+
+Some W1700K units carry this part instead of the W25N04KV; without an
+entry the chip does not probe ("unknown raw ID ef 8b 23 00") and the dumper
+has nothing to read. Its geometry is inferred, not taken from a datasheet:
+the stock loader reports 512 MiB and a 163-block BMT pool, which its pool
+sizing gives only for 2048 blocks, so 256 KiB blocks of 64 4 KiB pages with
+256 bytes of OOB. The raw whole-chip image is the same size as the
+W25N04KV's. Planes, ECC strength and status bits follow the W25N04LW.
+
+The W25N02KV OOB layout is generalised to 256 bytes of OOB, as Linux did
+for the W25N04LW; layouts for 128-byte parts are unchanged.
+
+--- a/drivers/mtd/nand/spi/winbond.c
++++ b/drivers/mtd/nand/spi/winbond.c
+@@ -147,13 +147,18 @@
+ 	return 0;
+ }
+ 
++/*
++ * One 16-byte spare section per 512-byte ECC step: 4 on 2 KiB pages, 8 on
++ * 4 KiB pages. Free bytes in the first half of the OOB area, ECC parity in
++ * the second.
++ */
+ static int w25n02kv_ooblayout_ecc(struct mtd_info *mtd, int section,
+ 				  struct mtd_oob_region *region)
+ {
+-	if (section > 3)
++	if (section >= mtd->writesize / 512)
+ 		return -ERANGE;
+ 
+-	region->offset = 64 + (16 * section);
++	region->offset = mtd->oobsize / 2 + (16 * section);
+ 	region->length = 13;
+ 
+ 	return 0;
+@@ -162,7 +167,7 @@
+ static int w25n02kv_ooblayout_free(struct mtd_info *mtd, int section,
+ 				   struct mtd_oob_region *region)
+ {
+-	if (section > 3)
++	if (section >= mtd->writesize / 512)
+ 		return -ERANGE;
+ 
+ 	region->offset = (16 * section) + 2;
+@@ -495,6 +500,21 @@
+ 		     NAND_ECCREQ(8, 512),
+ 		     SPINAND_INFO_OP_VARIANTS(&read_cache_variants,
+ 					      &write_cache_variants,
++					      &update_cache_variants),
++		     0,
++		     SPINAND_ECCINFO(&w25n02kv_ooblayout, w25n02kv_ecc_get_status)),
++	/*
++	 * Named "W25N04L" by the stock W1700K loader; no public datasheet for
++	 * this ID. 512 MiB in 2048 blocks (the stock loader's 163-block BMT
++	 * pool is total * 8 / 100), so 4 KiB pages; the remaining parameters
++	 * follow the W25N04LW (0xb2, 0x23) as added to Linux.
++	 */
++	SPINAND_INFO("W25N04L",
++		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_DUMMY, 0x8b, 0x23),
++		     NAND_MEMORG(1, 4096, 256, 64, 2048, 40, 1, 1, 1),
++		     NAND_ECCREQ(8, 512),
++		     SPINAND_INFO_OP_VARIANTS(&read_cache_variants,
++					      &write_cache_variants,
+ 					      &update_cache_variants),
+ 		     0,
+ 		     SPINAND_ECCINFO(&w25n02kv_ooblayout, w25n02kv_ecc_get_status)),

@@ -64,6 +64,7 @@ def run(settings, expect_serial=None, authorized_key=None, import_host_key=None,
         if backup_only:
             print(f'install: backup {existing}; stopping as asked (--backup-only)')
             return 0
+        backup.check_platform_part(console)
 
         rootfs, host_key = provision.provision(directory, authorized_key, import_host_key,
                                              address=settings.device_ip)

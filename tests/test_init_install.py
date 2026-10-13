@@ -259,6 +259,29 @@ class Parsing(unittest.TestCase):
                    '  - 0x000000000000-0x000020000000 : "spi-nand0"')
         self.assertEqual(backup.geometry(listing)['dump_bytes'], 0x22000000)
 
+    def test_geometry_of_a_4k_page_chip(self):
+        listing = ('  - min I/O: 0x1000 bytes\n  - OOB size: 256 bytes\n'
+                   '  - 0x000000000000-0x000020000000 : "spi-nand0"')
+        self.assertEqual(backup.geometry(listing)['dump_bytes'], 0x22000000)
+
+    def test_a_chip_that_did_not_probe_stops_the_serial_read(self):
+        with tempfile.TemporaryDirectory() as served:
+            unit = fake.FakeUnit(served, chip_probes=False)
+            unit.state = 'dumper'
+            unit.ram[backup.IDENTITY_SCRATCH] = b'\0' * backup.IDENTITY_BYTES
+            with self.assertRaisesRegex(StepFailed, 'not found'):
+                backup.read_serial(unit)
+            self.assertFalse(any(line.startswith('md.b') for _, line in unit.log))
+
+    def test_a_chip_of_another_geometry_is_not_written(self):
+        with tempfile.TemporaryDirectory() as served:
+            unit = fake.FakeUnit(served)
+            unit.state = 'dumper'
+            backup.check_platform_part(unit)
+            unit.page_bytes, unit.oob_bytes = 0x1000, 256
+            with self.assertRaisesRegex(StepFailed, 'nothing was written'):
+                backup.check_platform_part(unit)
+
     def test_a_writable_chip_is_refused(self):
         with self.assertRaisesRegex(StepFailed, 'read-only'):
             backup.check_read_only('  - flags: 0x400 (writeable)')

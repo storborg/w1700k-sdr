@@ -33,6 +33,8 @@ import partitions
 LINUX_SRC = SRC / 'linux'
 FIRMWARE_DIR = BUILD / 'linux-firmware'
 PHY_FIRMWARE = FIRMWARE_DIR / 'rtl8261n.bin'
+# W1700K2 units carry RTL8261CE PHYs, whose driver loads this file instead.
+PHY_FIRMWARE_CE = FIRMWARE_DIR / 'rtl_nic/rtl8261c.bin'
 LOG = LOGS / 'linux.log'
 # OpenWrt's kernel patch series, applied in this order before ours.
 OPENWRT_PATCH_DIRS = ('target/linux/generic/backport-6.18',
@@ -130,6 +132,17 @@ def phy_firmware(openwrt):
         shutil.copyfile(generated, PHY_FIRMWARE)
 
 
+def phy_firmware_ce():
+    """rtl_nic/rtl8261c.bin, the RTL8261C/CE register set, built into the kernel.
+
+    Realtek's file from linux-firmware (LICENSES/LICENSE.r8169), pinned by tag
+    and hash. Like rtl8261n.bin it must be present at the first probe.
+    """
+    pin = sources()['rtl8261c']
+    copy_if_changed(fetch.download(pin['url'], pin['sha256'], 'rtl8261c.bin'),
+                    PHY_FIRMWARE_CE)
+
+
 def kernel_make(*targets):
     run(['make', '-C', LINUX_SRC, f'O={LINUX_OUT}', 'ARCH=arm64',
          f'CROSS_COMPILE={CROSS_COMPILE}', f'-j{jobs()}', *targets],
@@ -170,6 +183,7 @@ def main():
             'no cross compiler; run platform/rootfs/build.py toolchain first')
     openwrt = prepare_source()
     phy_firmware(openwrt)
+    phy_firmware_ce()
     configure()
     kernel_make('Image', 'modules')
     device_tree(openwrt)

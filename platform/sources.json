@@ -41,5 +41,9 @@
       "patches/0001-Fix-endianness-when-building-on-big-endian-systems.patch": "d0345a8e9ea9726edc6a5da562fa0b4ad3c915192e82257dd8e067aad31ac7bb"
     },
     "output_sha256": "ae1963b2a84a17eaa2fb9052591bdb5152838feda045d7313f45a8608b918533"
+  },
+  "rtl8261c": {
+    "url": "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260910/rtl_nic/rtl8261c.bin",
+    "sha256": "2d93b7cd7ce7aae460ebca41dc5cca0ad80770d2129806ce46cc4e4064000bdc"
   }
 }

@@ -11,6 +11,9 @@ in LICENSES/.
   GPL-2.0 WITH Linux-syscall-note   include/uapi/w1700k_sdr.h
   BSD-3-Clause-Clear                files derived from MediaTek's mt76 driver,
                                     which keep their original attribution
+  LICENSE.r8169                     Realtek's RTL8261C PHY data (rtl8261c.bin),
+                                    fetched by the kernel build and built into
+                                    the kernel image; not in this repository
 
 MIT licence for this project:
 

@@ -22,6 +22,10 @@ import time
 MAX_RX = 16 * 1024 * 1024
 KEY_INTERVAL = 0.05
 KEY_BURST = b'    '
+# Ctrl-C: discards any partial line and gets a fresh prompt from U-Boot or the
+# Linux shell. An empty line would run the previous command again at a U-Boot
+# prompt (hush repeats the whole last line, repeatable commands or not).
+INTERRUPT = b'\x03'
 INTERRUPT_SECONDS = 15
 MAX_KEYS = 1200
 BOOT_SECONDS = 45
@@ -475,6 +479,12 @@ class ConsoleSession:
         self.sent_commands.append(line)
         self.event('command', line=line, mode='async')
         self.send_line(line)
+
+    def send_interrupt(self):
+        """Transmit one Ctrl-C: the state probe. It runs nothing at any prompt."""
+        self.check()
+        self.event('command', line='^C', mode='interrupt')
+        self._transmit(INTERRUPT, 'state probe')
 
     def interrupt_autoboot(self, which, limit=40.0, key_interval=0.2):
         """Key the console through an autoboot countdown until prompt `which`.

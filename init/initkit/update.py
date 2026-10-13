@@ -13,7 +13,7 @@ from .session import open_session
 
 
 def detect(settings):
-    """Report the console state; transmits one newline and nothing else."""
+    """Report the console state; transmits one Ctrl-C and nothing else."""
     with open_session(settings, 'detect', passive=True) as session:
         state = unit.identify(session.console, session.log)
     print(f'flash: the unit is at: {state}')

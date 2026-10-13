@@ -8,7 +8,7 @@
     init/flash --loader            # our U-Boot in the loader partition
     init/flash --durable           # erase durable storage
     init/flash --recovery          # boot the recovery system from RAM; writes nothing
-    init/flash --detect-only       # report where the unit is; transmits one newline
+    init/flash --detect-only       # report where the unit is; transmits one Ctrl-C
 
 Run `make` first. See init/README.md.
 """

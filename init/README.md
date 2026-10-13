@@ -80,7 +80,7 @@ make
 init/flash --system        # kernel, device tree and root
 init/flash --loader        # our U-Boot
 init/flash --durable       # erase durable storage
-init/flash --detect-only   # report where the unit is; sends one newline
+init/flash --detect-only   # report where the unit is; sends one Ctrl-C
 ```
 
 `init/flash` works from whatever state the unit is in (Linux, any U-Boot

@@ -19,6 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('init_uart', ROOT / 'init/initkit/uart.py')
 console = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(console)
+STATES_SPEC = importlib.util.spec_from_file_location('init_console',
+                                                     ROOT / 'init/initkit/console.py')
+states = importlib.util.module_from_spec(STATES_SPEC)
+STATES_SPEC.loader.exec_module(states)
 
 
 class CatcherTests(unittest.TestCase):
@@ -320,6 +324,40 @@ class SessionTests(SessionFixture):
         with self.assertRaisesRegex(RuntimeError, 'UART reader stopped'):
             self.session.check()
         self.assertEqual((Path(self.tmp.name) / 'rx.bin').read_bytes(), b'partial boot log\r\n')
+
+
+    def probe(self, answer):
+        """Run the state probe against a unit that answers Ctrl-C with `answer`."""
+        self.session.catcher.state = 'confirmed'     # no boot to catch here
+        received = []
+
+        def unit():
+            byte = b''
+            until = time.monotonic() + 3
+            while not byte and time.monotonic() < until:
+                if select.select([self.master], [], [], .1)[0]:
+                    byte = os.read(self.master, 4096)
+            received.append(byte)
+            os.write(self.master, answer)
+        thread = threading.Thread(target=unit)
+        thread.start()
+        log = type('Log', (), {'event': lambda self, kind, **fields: None})()
+        state = states.identify(self.session, log, settle=3)
+        thread.join()
+        # Nothing else follows: no newline, no command.
+        self.assertFalse(select.select([self.master], [], [], .3)[0])
+        return received[0], state
+
+    def test_the_state_probe_is_one_ctrl_c_and_never_a_newline(self):
+        for answer, expected in [(b'<INTERRUPT>\r\nSDR loader> ', 'loader'),
+                                 (b'<INTERRUPT>\r\ndumper> ', 'dumper'),
+                                 (b'\r\nECNT> ', 'stock'),
+                                 (b'^C\r\n~ # ', 'linux')]:
+            with self.subTest(expected):
+                sent, state = self.probe(answer)
+                self.assertEqual(sent, b'\x03')
+                self.assertEqual(state, expected)
+                self.session.buffer.clear()
 
 
 class PassiveSessionTests(SessionFixture):

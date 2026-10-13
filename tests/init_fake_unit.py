@@ -117,6 +117,9 @@ class FakeUnit:
             self.state = 'loader'
         return self.expect_prompt(which)
 
+    def send_interrupt(self):
+        self.log.append((self.state, '^C'))
+
     def send_async(self, line):
         self.check_command(line)
         self.log.append((self.state, line))

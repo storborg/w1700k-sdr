@@ -65,8 +65,15 @@ def verify_fit(console, address, algorithm='sha1'):
 
 
 def identify(console, log, settle=12.0):
-    """Name the console state, transmitting nothing but one newline."""
-    console.send_async('')
+    """Name the console state, transmitting nothing but one Ctrl-C.
+
+    Not a newline: at a U-Boot prompt an empty line runs the previous command
+    line again (a `tftpput`, a `ubi write`, a `saveenv`), and it would also run
+    whatever partial line the console holds. Ctrl-C discards both and every
+    prompt answers it with a fresh prompt; it also stops a countdown, as any key
+    does.
+    """
+    console.send_interrupt()
     start = console.mark()
     console.wait(lambda: any(console.at_prompt(name) for name in STATES), settle,
                  'a known prompt')
